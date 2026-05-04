@@ -55,6 +55,20 @@ export default definePluginEntry({
     // sessionKey → conversation context captured from inbound messages
     const sessions = new Map<string, ConversationContext>();
 
+    // Per-run card operation queue to serialize send → update → final.
+    // Prevents races where updateCard fires before sendInitialCard completes.
+    const cardQueues = new Map<string, Promise<void>>();
+
+    function enqueueCardOp(runId: string, op: () => Promise<void>): void {
+      const prev = cardQueues.get(runId) ?? Promise.resolve();
+      const next = prev.then(op, op);
+      cardQueues.set(runId, next);
+    }
+
+    function cleanupCardQueue(runId: string): void {
+      cardQueues.delete(runId);
+    }
+
     const sweepTimer = setInterval(() => tracker.sweepStale(), config.runTtlMs);
 
     // ── helpers ────────────────────────────────────────────────
@@ -178,10 +192,10 @@ export default definePluginEntry({
     ): void {
       switch (action.kind) {
         case "send_card":
-          void sendInitialCard(runId, sessionKey);
+          enqueueCardOp(runId, () => sendInitialCard(runId, sessionKey));
           break;
         case "update_card":
-          void updateCard(runId, sessionKey);
+          enqueueCardOp(runId, () => updateCard(runId, sessionKey));
           break;
         case "final_card": {
           const run = tracker.get(runId);
@@ -190,7 +204,7 @@ export default definePluginEntry({
             run?.steps ?? [],
             action.durationMs,
           );
-          void sendFinalCard(runId, sessionKey, card);
+          enqueueCardOp(runId, () => sendFinalCard(runId, sessionKey, card));
           break;
         }
         case "error_card": {
@@ -201,7 +215,7 @@ export default definePluginEntry({
             action.message,
             action.durationMs,
           );
-          void sendFinalCard(runId, sessionKey, card);
+          enqueueCardOp(runId, () => sendFinalCard(runId, sessionKey, card));
           break;
         }
       }
@@ -297,6 +311,7 @@ export default definePluginEntry({
         // Delayed cleanup so the final card edit has time to complete
         setTimeout(() => {
           tracker.cleanup(runId);
+          cleanupCardQueue(runId);
           if (ctx.sessionKey) sessions.delete(ctx.sessionKey);
         }, 5_000);
       });
@@ -307,6 +322,7 @@ export default definePluginEntry({
     api.on("gateway_stop", () => {
       gwClient.disconnect();
       clearInterval(sweepTimer);
+      cardQueues.clear();
     });
   },
 });

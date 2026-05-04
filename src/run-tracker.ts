@@ -24,8 +24,10 @@ export type RunState = {
   agentId?: string;
   startedAt: number;
   steps: ToolStep[];
-  /** Whether we've already sent the initial card for this run. */
+  /** Whether we've already initiated sending the initial card for this run. */
   cardSent: boolean;
+  /** Whether the initial card send completed and we have a messageId. */
+  cardReady: boolean;
   /** The messageId of the progress card (for in-place edits). */
   cardMessageId?: string;
   /** Timestamp of the last card update (for throttling). */
@@ -66,6 +68,7 @@ export class RunTracker {
         startedAt: Date.now(),
         steps: [],
         cardSent: false,
+        cardReady: false,
         lastCardUpdateAt: 0,
         thinkingSent: false,
       };
@@ -89,12 +92,13 @@ export class RunTracker {
     run.lastCardUpdateAt = Date.now();
   }
 
-  /** Set the card messageId after the initial send. */
+  /** Set the card messageId after the initial send completes. */
   setCardMessageId(runId: string, messageId: string): void {
     const run = this.runs.get(runId);
     if (run) {
       run.cardMessageId = messageId;
       run.cardSent = true;
+      run.cardReady = true;
     }
   }
 
@@ -110,6 +114,7 @@ export class RunTracker {
     run.thinkingSent = true;
 
     if (!run.cardSent) {
+      run.cardSent = true; // Mark immediately to prevent duplicate sends
       this.markUpdated(run);
       return { kind: "send_card" };
     }
@@ -130,6 +135,7 @@ export class RunTracker {
     run.steps.push({ name: toolName, description, done: false });
 
     if (!run.cardSent) {
+      run.cardSent = true; // Mark immediately to prevent duplicate sends
       this.markUpdated(run);
       return { kind: "send_card" };
     }
