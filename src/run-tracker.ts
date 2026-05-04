@@ -47,7 +47,6 @@ export class RunTracker {
   private runs = new Map<string, RunState>();
   private updateThrottleMs: number;
   private runTtlMs: number;
-
   constructor(params: { debounceMs: number; runTtlMs: number }) {
     this.updateThrottleMs = params.debounceMs;
     this.runTtlMs = params.runTtlMs;
