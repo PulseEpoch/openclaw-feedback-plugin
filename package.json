@@ -3,9 +3,24 @@
   "version": "0.1.0",
   "type": "module",
   "description": "OpenClaw plugin that sends real-time execution feedback to channels during agent task processing",
-  "main": "index.ts",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:openclaw --target=node22",
+    "prepare": "npm run build"
+  },
+  "files": [
+    "dist",
+    "index.ts",
+    "src",
+    "openclaw.plugin.json"
+  ],
   "openclaw": {
-    "extensions": ["./index.ts"],
+    "extensions": [
+      "./index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
     "compat": {
       "pluginApi": ">=2026.3.24-beta.2",
       "minGatewayVersion": "2026.3.24-beta.2"
@@ -15,5 +30,7 @@
       "pluginSdkVersion": "2026.3.24-beta.2"
     }
   },
-  "dependencies": {}
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
 }
