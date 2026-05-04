@@ -70,39 +70,33 @@ function buildCard(
   };
 }
 
-/** Format tool steps into markdown lines for the card body. */
-function stepsToMarkdown(steps: ToolStep[]): string {
-  if (steps.length === 0) return "";
-  const lines: string[] = [];
-  for (const step of steps) {
-    const icon = step.error ? "❌" : step.done ? "✅" : "🔥";
-    lines.push(`${icon} ${step.description}`);
-  }
-  return lines.join("\n");
-}
-
-/** Build the in-progress card shown while the agent is working. */
+/** Build the in-progress card: only the current step + counter. */
 export function buildProgressCard(
   locale: FeedbackLocale,
   steps: ToolStep[],
   thinking: boolean,
 ): FeishuCard {
   const l = labels(locale);
-  let body: string;
-  if (steps.length === 0) {
-    body = thinking ? `🤔 ${l.thinking}` : l.noSteps;
-  } else {
-    const md = stepsToMarkdown(steps);
-    body = thinking ? `🤔 ${l.thinking}\n${md}` : md;
-  }
+  const total = steps.length;
   const doneCount = steps.filter((s) => s.done).length;
-  const footer = steps.length > 0
-    ? `${doneCount}/${steps.length}`
-    : undefined;
+
+  // Find the latest active (not done) step, or the last step if all done
+  const current = [...steps].reverse().find((s) => !s.done) ?? steps[steps.length - 1];
+
+  let body: string;
+  if (total === 0) {
+    body = thinking ? `🤔 ${l.thinking}` : l.noSteps;
+  } else if (current && !current.done) {
+    body = `🔥 ${current.description}`;
+  } else {
+    body = thinking ? `🤔 ${l.thinking}` : `✅ ${current?.description ?? ""}`;
+  }
+
+  const footer = total > 0 ? `${doneCount}/${total}` : undefined;
   return buildCard(l.progressTitle, "blue", body, footer);
 }
 
-/** Build the final completion card. */
+/** Build the final completion card: just the summary. */
 export function buildCompletionCard(
   locale: FeedbackLocale,
   steps: ToolStep[],
@@ -110,12 +104,9 @@ export function buildCompletionCard(
 ): FeishuCard {
   const l = labels(locale);
   const secs = Math.round(durationMs / 1000);
-  const md = stepsToMarkdown(steps);
-  const body = md || `✅ ${l.completeTitle(secs)}`;
   return buildCard(
     l.completeTitle(secs),
     "green",
-    body,
     l.summary(steps.length, secs),
   );
 }
@@ -129,12 +120,10 @@ export function buildErrorCard(
 ): FeishuCard {
   const l = labels(locale);
   const secs = Math.round(durationMs / 1000);
-  const md = stepsToMarkdown(steps);
-  const body = md ? `${md}\n\n❌ ${errorMsg}` : `❌ ${errorMsg}`;
   return buildCard(
     l.errorTitle,
     "red",
-    body,
-    l.errorFooter(`${errorMsg} (${secs}s)`),
+    `❌ ${errorMsg}`,
+    l.summary(steps.length, secs),
   );
 }
