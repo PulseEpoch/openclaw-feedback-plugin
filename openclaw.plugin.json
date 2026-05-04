@@ -1,0 +1,62 @@
+{
+  "id": "feedback",
+  "name": "Real-time Feedback",
+  "description": "Sends real-time execution feedback (text + emoji) to channels during agent task processing, so users don't have to wait for the final result.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "locale": {
+        "type": "string",
+        "enum": ["zh", "en"],
+        "default": "zh"
+      },
+      "debounceMs": {
+        "type": "number",
+        "default": 2000,
+        "minimum": 500
+      },
+      "events": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "thinking": { "type": "boolean", "default": true },
+          "toolCalls": { "type": "boolean", "default": true },
+          "toolResults": { "type": "boolean", "default": true },
+          "completion": { "type": "boolean", "default": true }
+        }
+      },
+      "feishuCards": {
+        "type": "boolean",
+        "default": false
+      },
+      "runTtlMs": {
+        "type": "number",
+        "default": 300000,
+        "minimum": 30000
+      }
+    }
+  },
+  "uiHints": {
+    "enabled": {
+      "label": "Enable Feedback",
+      "help": "Send real-time feedback messages during agent execution."
+    },
+    "locale": {
+      "label": "Language",
+      "help": "Display language for feedback messages (zh or en)."
+    },
+    "debounceMs": {
+      "label": "Debounce (ms)",
+      "help": "Minimum interval between feedback messages per run."
+    },
+    "feishuCards": {
+      "label": "Feishu Cards",
+      "help": "Use Feishu interactive cards instead of plain text (future)."
+    }
+  }
+}

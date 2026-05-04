@@ -1,0 +1,19 @@
+{
+  "name": "@jerry/openclaw-feedback",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenClaw plugin that sends real-time execution feedback to channels during agent task processing",
+  "main": "index.ts",
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    },
+    "build": {
+      "openclawVersion": "2026.3.24-beta.2",
+      "pluginSdkVersion": "2026.3.24-beta.2"
+    }
+  },
+  "dependencies": {}
+}
