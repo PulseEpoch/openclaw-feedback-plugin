@@ -1,17 +1,18 @@
 /**
  * Per-run execution state machine.
  *
- * Tracks each agent run's phase and tool calls, handles debouncing,
- * and decides when to emit feedback messages.
+ * Tracks each agent run's phase and tool steps with human-readable
+ * descriptions. The card-based feedback system reads `steps` to
+ * build the progress card content.
  */
 
-export type RunPhase = "idle" | "thinking" | "tool" | "streaming" | "done" | "error";
+export type RunPhase = "idle" | "thinking" | "tool" | "done" | "error";
 
-export type ToolRecord = {
+/** A single tool call step shown in the progress card. */
+export type ToolStep = {
   name: string;
-  startedAt: number;
-  completedAt?: number;
-  result?: unknown;
+  description: string;
+  done: boolean;
   error?: string;
 };
 
@@ -22,28 +23,31 @@ export type RunState = {
   channelId?: string;
   agentId?: string;
   startedAt: number;
-  lastFeedbackAt: number;
-  tools: ToolRecord[];
-  pendingToolCount: number;
+  steps: ToolStep[];
+  /** Whether we've already sent the initial card for this run. */
+  cardSent: boolean;
+  /** The messageId of the progress card (for in-place edits). */
+  cardMessageId?: string;
+  /** Timestamp of the last card update (for throttling). */
+  lastCardUpdateAt: number;
+  /** Whether the "thinking" phase has been recorded. */
   thinkingSent: boolean;
 };
 
 export type FeedbackAction =
-  | { kind: "thinking" }
-  | { kind: "tool_start"; name: string }
-  | { kind: "tool_batch"; count: number }
-  | { kind: "tool_done"; name: string; result?: unknown }
-  | { kind: "done"; durationMs: number }
-  | { kind: "error"; message: string; durationMs: number }
+  | { kind: "send_card" }
+  | { kind: "update_card" }
+  | { kind: "final_card"; durationMs: number; success: true }
+  | { kind: "error_card"; durationMs: number; message: string }
   | { kind: "skip" };
 
 export class RunTracker {
   private runs = new Map<string, RunState>();
-  private debounceMs: number;
+  private updateThrottleMs: number;
   private runTtlMs: number;
 
   constructor(params: { debounceMs: number; runTtlMs: number }) {
-    this.debounceMs = params.debounceMs;
+    this.updateThrottleMs = params.debounceMs;
     this.runTtlMs = params.runTtlMs;
   }
 
@@ -60,9 +64,9 @@ export class RunTracker {
         channelId: ctx.channelId,
         agentId: ctx.agentId,
         startedAt: Date.now(),
-        lastFeedbackAt: 0,
-        tools: [],
-        pendingToolCount: 0,
+        steps: [],
+        cardSent: false,
+        lastCardUpdateAt: 0,
         thinkingSent: false,
       };
       this.runs.set(runId, run);
@@ -77,12 +81,21 @@ export class RunTracker {
     return this.runs.get(runId);
   }
 
-  private shouldDebounce(run: RunState): boolean {
-    return Date.now() - run.lastFeedbackAt < this.debounceMs;
+  private shouldThrottle(run: RunState): boolean {
+    return Date.now() - run.lastCardUpdateAt < this.updateThrottleMs;
   }
 
-  private markSent(run: RunState): void {
-    run.lastFeedbackAt = Date.now();
+  private markUpdated(run: RunState): void {
+    run.lastCardUpdateAt = Date.now();
+  }
+
+  /** Set the card messageId after the initial send. */
+  setCardMessageId(runId: string, messageId: string): void {
+    const run = this.runs.get(runId);
+    if (run) {
+      run.cardMessageId = messageId;
+      run.cardSent = true;
+    }
   }
 
   /** Model call started: agent is thinking. */
@@ -94,65 +107,59 @@ export class RunTracker {
     run.phase = "thinking";
 
     if (run.thinkingSent) return { kind: "skip" };
-    if (this.shouldDebounce(run)) return { kind: "skip" };
-
     run.thinkingSent = true;
-    this.markSent(run);
-    return { kind: "thinking" };
+
+    if (!run.cardSent) {
+      this.markUpdated(run);
+      return { kind: "send_card" };
+    }
+    if (this.shouldThrottle(run)) return { kind: "skip" };
+    this.markUpdated(run);
+    return { kind: "update_card" };
   }
 
-  /** Tool call is about to start. */
+  /** Tool call is about to start. Add a step with description. */
   onBeforeToolCall(
     runId: string,
+    description: string,
     toolName: string,
     ctx: { sessionKey?: string; channelId?: string; agentId?: string },
   ): FeedbackAction {
     const run = this.getOrCreate(runId, ctx);
     run.phase = "tool";
-    run.pendingToolCount++;
-    run.tools.push({ name: toolName, startedAt: Date.now() });
+    run.steps.push({ name: toolName, description, done: false });
 
-    if (this.shouldDebounce(run)) {
-      // Check if we have multiple pending tools accumulating during debounce.
-      // We'll send a batch notification after debounce clears.
-      return { kind: "skip" };
+    if (!run.cardSent) {
+      this.markUpdated(run);
+      return { kind: "send_card" };
     }
-
-    if (run.pendingToolCount > 1) {
-      this.markSent(run);
-      return { kind: "tool_batch", count: run.pendingToolCount };
-    }
-
-    this.markSent(run);
-    return { kind: "tool_start", name: toolName };
+    if (this.shouldThrottle(run)) return { kind: "skip" };
+    this.markUpdated(run);
+    return { kind: "update_card" };
   }
 
-  /** Tool call completed. */
+  /** Tool call completed. Mark the step as done. */
   onAfterToolCall(
     runId: string,
     toolName: string,
-    result?: unknown,
     error?: string,
   ): FeedbackAction {
     const run = this.runs.get(runId);
     if (!run) return { kind: "skip" };
 
-    run.pendingToolCount = Math.max(0, run.pendingToolCount - 1);
-
-    const record = run.tools.findLast((t) => t.name === toolName && !t.completedAt);
-    if (record) {
-      record.completedAt = Date.now();
-      record.result = result;
-      record.error = error;
+    const step = [...run.steps].reverse().find((s) => s.name === toolName && !s.done);
+    if (step) {
+      step.done = true;
+      step.error = error;
     }
 
-    if (this.shouldDebounce(run)) return { kind: "skip" };
-
-    this.markSent(run);
-    return { kind: "tool_done", name: toolName, result };
+    if (!run.cardSent) return { kind: "skip" };
+    if (this.shouldThrottle(run)) return { kind: "skip" };
+    this.markUpdated(run);
+    return { kind: "update_card" };
   }
 
-  /** Agent run ended. Always emits (no debounce for terminal states). */
+  /** Agent run ended. Always emits (no throttle for terminal states). */
   onAgentEnd(
     runId: string,
     success: boolean,
@@ -163,15 +170,20 @@ export class RunTracker {
 
     const durationMs = Date.now() - run.startedAt;
 
+    // Mark all remaining steps as done
+    for (const step of run.steps) {
+      if (!step.done) step.done = true;
+    }
+
     if (success) {
       run.phase = "done";
-      this.markSent(run);
-      return { kind: "done", durationMs };
+      this.markUpdated(run);
+      return { kind: "final_card", durationMs, success: true };
     }
 
     run.phase = "error";
-    this.markSent(run);
-    return { kind: "error", message: error ?? "unknown error", durationMs };
+    this.markUpdated(run);
+    return { kind: "error_card", durationMs, message: error ?? "unknown error" };
   }
 
   /** Remove a completed run from tracking. */

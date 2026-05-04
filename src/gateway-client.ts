@@ -9,6 +9,50 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+/**
+ * Convert a Feishu schema 2.0 card to a gateway presentation object.
+ * Extracts the header title and markdown body elements as text blocks.
+ */
+function cardToPresentation(card: Record<string, unknown>): {
+  title?: string;
+  tone?: string;
+  blocks: Array<{ type: string; text?: string }>;
+} {
+  const header = card.header as Record<string, unknown> | undefined;
+  const title = (header?.title as Record<string, unknown> | undefined)?.content as string | undefined;
+  const template = header?.template as string | undefined;
+
+  const toneMap: Record<string, string> = {
+    blue: "info", turquoise: "info", wathet: "info",
+    green: "success", lime: "success",
+    red: "danger", carmine: "danger",
+    orange: "warning", yellow: "warning",
+    grey: "neutral", purple: "neutral", indigo: "neutral", violet: "neutral",
+  };
+  const tone = template ? toneMap[template] ?? "info" : "info";
+
+  const blocks: Array<{ type: string; text?: string }> = [];
+  const body = card.body as Record<string, unknown> | undefined;
+  const elements = (body?.elements ?? []) as Array<Record<string, unknown>>;
+  for (const el of elements) {
+    if (el.tag === "markdown" && typeof el.content === "string") {
+      blocks.push({ type: "text", text: el.content });
+    } else if (el.tag === "hr") {
+      blocks.push({ type: "divider" });
+    } else if (el.tag === "note") {
+      const noteEls = (el.elements ?? []) as Array<Record<string, unknown>>;
+      const text = noteEls.map((n) => n.content ?? "").join(" ");
+      if (text) blocks.push({ type: "context", text });
+    }
+  }
+
+  if (blocks.length === 0 && title) {
+    blocks.push({ type: "text", text: title });
+  }
+
+  return { title, tone, blocks };
+}
+
 function readTokenFromConfig(): string {
   try {
     const home = process.env.HOME ?? "";
@@ -50,6 +94,24 @@ export type SendResult = {
   chatId?: string;
   channelId?: string;
   runId?: string;
+};
+
+export type MessageActionParams = {
+  channel: string;
+  action: string;
+  params: Record<string, unknown>;
+  accountId?: string;
+  sessionKey?: string;
+  idempotencyKey?: string;
+};
+
+export type MessageActionResult = {
+  ok?: boolean;
+  channel?: string;
+  action?: string;
+  messageId?: string;
+  chatId?: string;
+  contentType?: string;
 };
 
 type PendingRequest = {
@@ -237,6 +299,65 @@ export class FeedbackGatewayClient {
     return this.request<SendResult>("send", {
       ...params,
       idempotencyKey: params.idempotencyKey ?? randomUUID(),
+    });
+  }
+
+  /** Dispatch a channel message action (send card, edit message, etc.). */
+  async messageAction(params: MessageActionParams): Promise<MessageActionResult> {
+    return this.request<MessageActionResult>("message.action", {
+      ...params,
+      idempotencyKey: params.idempotencyKey ?? randomUUID(),
+    });
+  }
+
+  /**
+   * Send a Feishu interactive card via the presentation abstraction.
+   * Uses `message.action` send with `presentation` param, which the
+   * Feishu channel converts to an interactive card. Returns the
+   * messageId for later in-place card edits.
+   */
+  async sendCard(params: {
+    to: string;
+    card: Record<string, unknown>;
+    channel: string;
+    accountId?: string;
+    sessionKey?: string;
+    /** Presentation blocks for the initial card send. */
+    presentation?: {
+      title?: string;
+      tone?: string;
+      blocks: Array<{ type: string; text?: string }>;
+    };
+  }): Promise<string | undefined> {
+    const presentation = params.presentation ?? cardToPresentation(params.card);
+    const result = await this.messageAction({
+      channel: params.channel,
+      action: "send",
+      params: {
+        to: params.to,
+        presentation,
+      },
+      accountId: params.accountId,
+      sessionKey: params.sessionKey,
+    });
+    return result.messageId;
+  }
+
+  /** Edit an existing Feishu message with updated card content. */
+  async editCard(params: {
+    messageId: string;
+    card: Record<string, unknown>;
+    channel: string;
+    accountId?: string;
+  }): Promise<void> {
+    await this.messageAction({
+      channel: params.channel,
+      action: "edit",
+      params: {
+        messageId: params.messageId,
+        card: params.card,
+      },
+      accountId: params.accountId,
     });
   }
 

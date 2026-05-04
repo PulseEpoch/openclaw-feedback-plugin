@@ -1,54 +1,96 @@
 /**
- * Message formatting for feedback notifications.
+ * Formatting helpers for feedback notifications.
  *
- * Produces text+emoji messages in zh or en locale.
+ * Extracts human-readable descriptions from tool call params
+ * and produces localized text.
  */
 
 import type { FeedbackLocale } from "./config.js";
 
-type Messages = {
-  thinking: string;
-  toolStart: (name: string) => string;
-  toolBatch: (count: number) => string;
-  toolDone: (name: string) => string;
-  toolDoneWithSummary: (name: string, summary: string) => string;
-  done: string;
-  doneWithDuration: (seconds: number) => string;
-  error: (msg: string) => string;
-};
+/** Extract a short, useful description from a tool's name and params. */
+export function describeToolCall(
+  toolName: string,
+  params?: Record<string, unknown>,
+  locale: FeedbackLocale = "zh",
+): string {
+  const p = params ?? {};
+  const zh = locale === "zh";
 
-const ZH: Messages = {
-  thinking: "\u{1f914} \u6b63\u5728\u601d\u8003...",
-  toolStart: (name) => `\u{1f525} \u6b63\u5728\u4f7f\u7528\u5de5\u5177: ${name}...`,
-  toolBatch: (count) => `\u{1f525} \u6b63\u5728\u4f7f\u7528 ${count} \u4e2a\u5de5\u5177...`,
-  toolDone: (name) => `\u2705 \u5de5\u5177\u5b8c\u6210: ${name}`,
-  toolDoneWithSummary: (name, summary) => `\u2705 \u5de5\u5177\u5b8c\u6210: ${name}\n${summary}`,
-  done: "\u2705 \u4efb\u52a1\u5b8c\u6210",
-  doneWithDuration: (s) => `\u2705 \u4efb\u52a1\u5b8c\u6210 (\u8017\u65f6 ${s}s)`,
-  error: (msg) => `\u274c \u51fa\u9519\u4e86: ${msg}`,
-};
-
-const EN: Messages = {
-  thinking: "\u{1f914} Thinking...",
-  toolStart: (name) => `\u{1f525} Running tool: ${name}...`,
-  toolBatch: (count) => `\u{1f525} Running ${count} tools...`,
-  toolDone: (name) => `\u2705 Tool done: ${name}`,
-  toolDoneWithSummary: (name, summary) => `\u2705 Tool done: ${name}\n${summary}`,
-  done: "\u2705 Task completed",
-  doneWithDuration: (s) => `\u2705 Task completed (${s}s)`,
-  error: (msg) => `\u274c Error: ${msg}`,
-};
-
-const LOCALES: Record<FeedbackLocale, Messages> = { zh: ZH, en: EN };
-
-export function getMessages(locale: FeedbackLocale): Messages {
-  return LOCALES[locale] ?? ZH;
+  switch (toolName) {
+    case "read":
+    case "read_file": {
+      const fp = shortPath(getString(p, "file_path"));
+      return fp ? (zh ? `读取 ${fp}` : `Read ${fp}`) : (zh ? "读取文件" : "Read file");
+    }
+    case "edit":
+    case "edit_file": {
+      const fp = shortPath(getString(p, "file_path"));
+      return fp ? (zh ? `编辑 ${fp}` : `Edit ${fp}`) : (zh ? "编辑文件" : "Edit file");
+    }
+    case "write":
+    case "write_file": {
+      const fp = shortPath(getString(p, "file_path"));
+      return fp ? (zh ? `写入 ${fp}` : `Write ${fp}`) : (zh ? "写入文件" : "Write file");
+    }
+    case "exec":
+    case "shell": {
+      const cmd = truncate(getString(p, "command"), 60);
+      return cmd ? (zh ? `执行 \`${cmd}\`` : `Run \`${cmd}\``) : (zh ? "执行命令" : "Run command");
+    }
+    case "grep":
+    case "search": {
+      const pat = getString(p, "pattern") ?? getString(p, "query");
+      const dir = shortPath(getString(p, "path"));
+      if (pat && dir) return zh ? `搜索 "${pat}" in ${dir}` : `Search "${pat}" in ${dir}`;
+      if (pat) return zh ? `搜索 "${pat}"` : `Search "${pat}"`;
+      return zh ? "搜索代码" : "Search code";
+    }
+    case "find_file_by_name":
+    case "glob": {
+      const pat = getString(p, "pattern") ?? getString(p, "glob");
+      return pat ? (zh ? `查找 ${pat}` : `Find ${pat}`) : (zh ? "查找文件" : "Find files");
+    }
+    case "notebook_read": {
+      const fp = shortPath(getString(p, "notebook_path"));
+      return fp ? (zh ? `读取 ${fp}` : `Read ${fp}`) : (zh ? "读取 notebook" : "Read notebook");
+    }
+    case "notebook_edit": {
+      const fp = shortPath(getString(p, "notebook_path"));
+      return fp ? (zh ? `编辑 ${fp}` : `Edit ${fp}`) : (zh ? "编辑 notebook" : "Edit notebook");
+    }
+    case "run_subagent": {
+      const title = getString(p, "title");
+      return title ? (zh ? `子任务: ${truncate(title, 40)}` : `Subtask: ${truncate(title, 40)}`) : (zh ? "启动子任务" : "Run subtask");
+    }
+    case "webfetch":
+    case "web_fetch": {
+      const url = getString(p, "url");
+      if (url) {
+        try { return zh ? `访问 ${new URL(url).hostname}` : `Fetch ${new URL(url).hostname}`; } catch { /* ignore */ }
+      }
+      return zh ? "访问网页" : "Fetch web";
+    }
+    default:
+      return toolName;
+  }
 }
 
-/** Truncate a tool result to a brief summary. */
-export function summarizeToolResult(result: unknown, maxLen = 120): string {
-  if (result == null) return "";
-  const text = typeof result === "string" ? result : JSON.stringify(result);
-  if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen) + "...";
+// ── helpers ─────────────────────────────────────────────────
+
+function getString(obj: Record<string, unknown>, key: string): string | undefined {
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** Shorten an absolute path to the last 2-3 components. */
+function shortPath(fp: string | undefined): string | undefined {
+  if (!fp) return undefined;
+  const parts = fp.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length <= 2) return parts.join("/");
+  return parts.slice(-2).join("/");
+}
+
+function truncate(s: string | undefined, max: number): string | undefined {
+  if (!s) return undefined;
+  return s.length <= max ? s : s.slice(0, max) + "...";
 }

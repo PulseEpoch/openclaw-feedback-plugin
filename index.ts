@@ -1,25 +1,31 @@
 /**
  * OpenClaw Feedback Plugin
  *
- * Sends real-time execution feedback (text + emoji) to the user's channel
- * during agent task processing, so users don't have to wait for the final
- * result to know what's happening.
+ * Sends a single interactive Feishu card per agent run and edits it
+ * in-place as the run progresses. Each tool call adds a descriptive
+ * line (e.g., "Read src/config.ts", "Run `npm test`"), and the final
+ * card shows a completion summary.
  *
  * Hooks used:
  *   message_received   — capture conversation context per session
  *   message_sent        — refine outbound target from proven send path
- *   model_call_started  — "thinking" notification
- *   before_tool_call    — tool start / batch notification
- *   after_tool_call     — tool completion notification
- *   agent_end           — completion / error notification
+ *   model_call_started  — send initial "thinking" card (or update)
+ *   before_tool_call    — add step to card
+ *   after_tool_call     — mark step done, update card
+ *   agent_end           — replace card with completion/error card
  *   gateway_stop        — cleanup
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig } from "./src/config.js";
 import { RunTracker } from "./src/run-tracker.js";
-import { getMessages, summarizeToolResult } from "./src/formatters.js";
+import { describeToolCall } from "./src/formatters.js";
 import { FeedbackGatewayClient } from "./src/gateway-client.js";
+import {
+  buildProgressCard,
+  buildCompletionCard,
+  buildErrorCard,
+} from "./src/feishu-cards.js";
 
 type ConversationContext = {
   channelId: string;
@@ -32,7 +38,7 @@ export default definePluginEntry({
   id: "feedback",
   name: "Real-time Feedback",
   description:
-    "Sends real-time execution feedback to channels during agent task processing",
+    "Sends a single updatable card with real-time execution progress to channels",
 
   register(api) {
     const config = resolveConfig(api.pluginConfig);
@@ -45,7 +51,6 @@ export default definePluginEntry({
     });
 
     const gwClient = new FeedbackGatewayClient();
-    const msgs = getMessages(config.locale);
 
     // sessionKey → conversation context captured from inbound messages
     const sessions = new Map<string, ConversationContext>();
@@ -63,25 +68,142 @@ export default definePluginEntry({
       }
     }
 
-    async function sendFeedback(
+    /** Send the initial progress card and store its messageId. */
+    async function sendInitialCard(
+      runId: string,
       sessionKey: string | undefined,
-      text: string,
     ): Promise<void> {
       if (!sessionKey) return;
       const ctx = sessions.get(sessionKey);
       if (!ctx) return;
       if (!(await ensureConnected())) return;
+
+      const run = tracker.get(runId);
+      if (!run) return;
+
+      const card = buildProgressCard(
+        config.locale,
+        run.steps,
+        run.phase === "thinking",
+      );
+
       try {
-        await gwClient.send({
+        const messageId = await gwClient.sendCard({
           to: ctx.to,
+          card,
           channel: ctx.channelId,
           accountId: ctx.accountId,
-          threadId: ctx.threadId,
-          message: text,
           sessionKey,
         });
+        if (messageId) {
+          tracker.setCardMessageId(runId, messageId);
+        }
       } catch {
-        // Best-effort: swallow send errors for feedback messages
+        // Best-effort
+      }
+    }
+
+    /** Update the existing progress card in-place. */
+    async function updateCard(
+      runId: string,
+      sessionKey: string | undefined,
+    ): Promise<void> {
+      if (!sessionKey) return;
+      const ctx = sessions.get(sessionKey);
+      if (!ctx) return;
+
+      const run = tracker.get(runId);
+      if (!run?.cardMessageId) return;
+      if (!(await ensureConnected())) return;
+
+      const card = buildProgressCard(
+        config.locale,
+        run.steps,
+        run.phase === "thinking",
+      );
+
+      try {
+        await gwClient.editCard({
+          messageId: run.cardMessageId,
+          card,
+          channel: ctx.channelId,
+          accountId: ctx.accountId,
+        });
+      } catch {
+        // Best-effort
+      }
+    }
+
+    /** Replace the card with a final completion or error card. */
+    async function sendFinalCard(
+      runId: string,
+      sessionKey: string | undefined,
+      finalCard: Record<string, unknown>,
+    ): Promise<void> {
+      if (!sessionKey) return;
+      const ctx = sessions.get(sessionKey);
+      if (!ctx) return;
+
+      const run = tracker.get(runId);
+      if (!(await ensureConnected())) return;
+
+      try {
+        if (run?.cardMessageId) {
+          await gwClient.editCard({
+            messageId: run.cardMessageId,
+            card: finalCard,
+            channel: ctx.channelId,
+            accountId: ctx.accountId,
+          });
+        } else {
+          await gwClient.sendCard({
+            to: ctx.to,
+            card: finalCard,
+            channel: ctx.channelId,
+            accountId: ctx.accountId,
+            sessionKey,
+          });
+        }
+      } catch {
+        // Best-effort
+      }
+    }
+
+    // ── dispatch helper ───────────────────────────────────────
+
+    function handleAction(
+      action: ReturnType<RunTracker["onModelCallStarted"]>,
+      runId: string,
+      sessionKey: string | undefined,
+    ): void {
+      switch (action.kind) {
+        case "send_card":
+          void sendInitialCard(runId, sessionKey);
+          break;
+        case "update_card":
+          void updateCard(runId, sessionKey);
+          break;
+        case "final_card": {
+          const run = tracker.get(runId);
+          const card = buildCompletionCard(
+            config.locale,
+            run?.steps ?? [],
+            action.durationMs,
+          );
+          void sendFinalCard(runId, sessionKey, card);
+          break;
+        }
+        case "error_card": {
+          const run = tracker.get(runId);
+          const card = buildErrorCard(
+            config.locale,
+            run?.steps ?? [],
+            action.message,
+            action.durationMs,
+          );
+          void sendFinalCard(runId, sessionKey, card);
+          break;
+        }
       }
     }
 
@@ -101,7 +223,6 @@ export default definePluginEntry({
       });
     });
 
-    // Refine `to` from proven outbound path when available
     api.on("message_sent", (event, ctx) => {
       if (!ctx.sessionKey || !event.to || !event.success) return;
       const existing = sessions.get(ctx.sessionKey);
@@ -127,9 +248,7 @@ export default definePluginEntry({
           channelId: ctx.channelId,
           agentId: ctx.agentId,
         });
-        if (action.kind === "thinking") {
-          void sendFeedback(ctx.sessionKey, msgs.thinking);
-        }
+        handleAction(action, runId, ctx.sessionKey);
       });
     }
 
@@ -139,15 +258,16 @@ export default definePluginEntry({
       api.on("before_tool_call", (event, ctx) => {
         const runId = event.runId ?? ctx.runId;
         if (!runId) return;
-        const action = tracker.onBeforeToolCall(runId, event.toolName, {
+        const desc = describeToolCall(
+          event.toolName,
+          event.params as Record<string, unknown> | undefined,
+          config.locale,
+        );
+        const action = tracker.onBeforeToolCall(runId, desc, event.toolName, {
           sessionKey: ctx.sessionKey,
           agentId: ctx.agentId,
         });
-        if (action.kind === "tool_start") {
-          void sendFeedback(ctx.sessionKey, msgs.toolStart(action.name));
-        } else if (action.kind === "tool_batch") {
-          void sendFeedback(ctx.sessionKey, msgs.toolBatch(action.count));
-        }
+        handleAction(action, runId, ctx.sessionKey);
       });
     }
 
@@ -160,16 +280,9 @@ export default definePluginEntry({
         const action = tracker.onAfterToolCall(
           runId,
           event.toolName,
-          event.result,
           event.error,
         );
-        if (action.kind === "tool_done") {
-          const summary = summarizeToolResult(action.result);
-          const text = summary
-            ? msgs.toolDoneWithSummary(action.name, summary)
-            : msgs.toolDone(action.name);
-          void sendFeedback(ctx.sessionKey, text);
-        }
+        handleAction(action, runId, ctx.sessionKey);
       });
     }
 
@@ -180,13 +293,8 @@ export default definePluginEntry({
         const runId = event.runId ?? ctx.runId;
         if (!runId) return;
         const action = tracker.onAgentEnd(runId, event.success, event.error);
-        if (action.kind === "done") {
-          const secs = Math.round(action.durationMs / 1000);
-          void sendFeedback(ctx.sessionKey, msgs.doneWithDuration(secs));
-        } else if (action.kind === "error") {
-          void sendFeedback(ctx.sessionKey, msgs.error(action.message));
-        }
-        // Delayed cleanup so the final message has time to send
+        handleAction(action, runId, ctx.sessionKey);
+        // Delayed cleanup so the final card edit has time to complete
         setTimeout(() => {
           tracker.cleanup(runId);
           if (ctx.sessionKey) sessions.delete(ctx.sessionKey);
